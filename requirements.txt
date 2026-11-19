@@ -1,0 +1,7 @@
+cryptography
+google-genai
+kokoro-onnx
+numpy
+opencv-python-headless
+pillow
+soundfile

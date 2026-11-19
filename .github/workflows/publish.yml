@@ -1,0 +1,59 @@
+name: publish
+run-name: publish ${{ github.event_name == 'schedule' && 'check' || 'now' }}
+
+# Finished videos from the phone -> details -> YouTube with the batch's publish time (see publish.py).
+# The phone starts it right after an upload; the 2-hourly run picks up anything left over (YouTube's daily
+# upload limit, a failure to retry, a schedule change). Only one run at a time; a new start waits its turn.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 */2 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      RECAP_PRIVKEY: ${{ secrets.RECAP_PRIVKEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Anything to do?
+        id: check
+        run: |
+          n=$(gh api "repos/${{ github.repository }}/releases/tags/jobs" --jq '[.assets[].name | select(test("^p[a-f0-9]{12}\\.json\\.enc$"))] | length' || echo 0)
+          echo "videos=$n" >> "$GITHUB_OUTPUT"
+          echo "$n videos in the queue"
+
+      - name: Install tools
+        if: steps.check.outputs.videos != '0'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg > /dev/null
+
+      - uses: actions/setup-python@v5
+        if: steps.check.outputs.videos != '0'
+        with: { python-version: "3.12", cache: pip }
+
+      - name: Publish
+        if: steps.check.outputs.videos != '0'
+        run: |
+          pip install -q cryptography google-genai requests
+          python publish.py
+
+      # GitHub switches off timed runs in a repo with no commits for 60 days: leave a tiny commit every ~50 days
+      - name: Keep the timer alive
+        if: github.event_name == 'schedule'
+        run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt $(( 50 * 86400 )) ]; then
+            git config user.name "Manhua Recap"; git config user.email "bot@users.noreply.github.com"
+            git commit --allow-empty -m "keep scheduled publishing on" && git push
+          fi

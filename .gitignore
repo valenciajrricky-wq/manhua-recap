@@ -1,0 +1,9 @@
+.venv/
+models/
+test/
+jobs/
+android/
+__pycache__/
+*.mp4
+*.wav
+keys/

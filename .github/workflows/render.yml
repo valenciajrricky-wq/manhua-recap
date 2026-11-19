@@ -1,0 +1,108 @@
+name: render
+run-name: recap ${{ inputs.job_id }}
+
+# The repo is public (free unlimited minutes), so everything a job uploads or publishes is encrypted:
+# see crypto.py. The phone sends `wrapped` (its job key, locked with public_key.pem) and `meta`
+# (its settings, encrypted with that key). Plain inputs are only for older app versions.
+on:
+  workflow_dispatch:
+    inputs:
+      job_id: { description: "Job id", required: true }
+      wrapped: { default: "" }
+      meta: { default: "" }
+      lang: { default: "en" }
+      aspect: { default: "9:16" }
+      voice: { default: "" }
+      title: { default: "" }
+      detail: { default: "more" }
+
+permissions:
+  contents: write
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      RECAP_PRIVKEY: ${{ secrets.RECAP_PRIVKEY }}
+      YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+      YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+      YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+      JOB: ${{ inputs.job_id }}
+      WRAPPED: ${{ inputs.wrapped }}
+      META: ${{ inputs.meta }}
+      LANG_CODE: ${{ inputs.lang }}
+      ASPECT: ${{ inputs.aspect }}
+      VOICE: ${{ inputs.voice }}
+      TITLE: ${{ inputs.title }}
+      DETAIL: ${{ inputs.detail }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download pages
+        run: |
+          [[ "$JOB" =~ ^[a-f0-9]{12}$ ]] || { echo "bad job id"; exit 1; }
+          mkdir -p in state out
+          if [ -n "$WRAPPED" ]; then gh release download jobs -p "$JOB.zip.enc" -D in; else gh release download jobs -p "$JOB.zip" -D in; fi
+          gh release download jobs -p series.json.enc -D state || true
+
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg > /dev/null
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+
+      - uses: actions/cache@v4
+        with: { path: models, key: kokoro-v1.0-int8 }
+
+      - name: Install voice
+        run: |
+          pip install -q -r requirements.txt
+          mkdir -p models
+          B=https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0
+          [ -f models/kokoro-v1.0.int8.onnx ] || curl -sL -o models/kokoro-v1.0.int8.onnx $B/kokoro-v1.0.int8.onnx
+          [ -f models/voices-v1.0.bin ] || curl -sL -o models/voices-v1.0.bin $B/voices-v1.0.bin
+
+      - name: Unlock
+        run: python crypto.py unlock "$JOB"
+
+      - name: Write script
+        run: python pipeline.py "in/$JOB.zip" --stage script --meta state/meta.json
+
+      - name: Record voice
+        run: python pipeline.py "in/$JOB.zip" --stage voice --meta state/meta.json
+
+      - name: Make video
+        run: python pipeline.py "in/$JOB.zip" --stage video --out "out/$JOB.mp4" --meta state/meta.json --series-file state/series.json
+
+      - name: Post
+        continue-on-error: true
+        run: python post.py "$JOB"
+
+      - name: Upload video
+        run: |
+          python crypto.py lock "$JOB"
+          if [ -f state/jobkey ]; then
+            gh release upload jobs out/$JOB*.enc --clobber
+          else
+            gh release upload jobs out/$JOB.mp4 out/${JOB}_script.txt $( [ -f out/${JOB}_169.mp4 ] && echo out/${JOB}_169.mp4 ) --clobber
+          fi
+          [ -f state/series.json.enc ] && gh release upload jobs state/series.json.enc --clobber || true
+
+      - name: Clean up
+        if: always()
+        run: |
+          rm -f state/jobkey
+          gh release delete-asset jobs "$JOB.zip" -y 2>/dev/null || true
+          gh release delete-asset jobs "$JOB.zip.enc" -y 2>/dev/null || true
+          # delete render files older than 3 days so storage never fills up (the series music map stays,
+          # and so do the publishing queue's files: p<id>.*, acct.enc, status.enc - publish.py looks after those)
+          cutoff=$(date -d '3 days ago' +%s)
+          gh api "repos/${{ github.repository }}/releases/tags/jobs" --jq '.assets[] | "\(.id) \(.created_at) \(.name)"' |
+          while read id created name; do
+            [ "$name" = "series.json.enc" ] && continue
+            [[ "$name" =~ ^p[a-f0-9]{12}\. || "$name" = "acct.enc" || "$name" = "status.enc" ]] && continue
+            [ "$(date -d "$created" +%s)" -lt "$cutoff" ] && gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$id" || true
+          done
